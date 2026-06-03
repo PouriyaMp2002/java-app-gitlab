@@ -187,7 +187,7 @@ To deploy this project to AWS ECS, the following resources are usually required:
 - CloudWatch logs
 
 Some of these resources can be created manually, while others can be provisioned using Terraform.
-
+ 
 ---
 
 ## Required CI/CD Variables
