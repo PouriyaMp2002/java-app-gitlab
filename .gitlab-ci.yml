@@ -1,0 +1,183 @@
+stages:
+  - build
+  - sonarqube_analysis
+  - trivy_scan
+  - DockerBuild_Trivy_DockerPush
+  - deploy_to_ECS
+
+
+default:
+  tags:
+    - gitlab
+  image: maven:3.9-eclipse-temurin-17
+  
+
+variables:
+  MAVEN_CLI_OPTS: "--batch-mode"
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}"
+  GIT_DEPTH: "0"
+  BULK_MIGRATE: true
+  IMAGE_TAG: "v$CI_PIPELINE_IID"
+
+cache:
+  key: "maven-cache-$CI_COMMIT_REF_SLUG"
+  paths:
+    - .m2/repository/    
+    - .sonar/cache
+    - .trivycache/
+
+
+build:
+  stage: build
+  script:
+    - mvn $MAVEN_CLI_OPTS -Dmaven.repo.local=.m2/repository dependency:go-offline
+    - mvn $MAVEN_CLI_OPTS -Dmaven.repo.local=.m2/repository clean verify
+
+
+  artifacts:
+    when: always
+    paths:      
+      - target/*.war      
+    reports:
+      junit:
+        - target/surefire-reports/*.xml
+    expire_in: 1 week
+
+sonarqube:
+  stage: sonarqube_analysis
+  needs:
+    - build
+  script:
+    - >
+      mvn $MAVEN_CLI_OPTS -Dmaven.repo.local=.m2/repository sonar:sonar
+      -Dsonar.projectKey=$CI_PROJECT_PATH_SLUG
+      -Dsonar.projectName="$CI_PROJECT_NAME"
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.token=$SONAR_TOKEN
+      -Dsonar.qualitygate.wait=true
+      -Dsonar.qualitygate.timeout=600
+  allow_failure: false
+
+scan:
+  stage: trivy_scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs:
+    - job: build
+      artifacts: true
+
+  cache:
+    key: "maven-cache-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .m2/repository/
+      - .trivycache/
+  variables:
+    TRIVY_CACHE_DIR: "$CI_PROJECT_DIR/.trivycache"
+  script:
+    - trivy fs --scanners vuln --severity CRITICAL --exit-code 0 --format table target/*.war
+    
+Docker:
+  stage: DockerBuild_Trivy_DockerPush
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+
+    - apk add --no-cache jq wget docker-credential-ecr-login
+    - mkdir -p ~/.docker
+    - echo "{\"credHelpers\":{\"$ECR_REGISTRY\":\"ecr-login\"}}" > ~/.docker/config.json
+    - wget -qO- https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+    - docker info
+    - trivy --version
+
+  script:
+    # Build once, tag twice — avoids the "image not found" error you had
+    - docker build -t "$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG" .
+
+    - trivy image --scanners vuln --ignore-unfixed --severity CRITICAL --exit-code 0 "$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
+
+    - docker push "$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
+    
+
+deploy_to_ECS:
+  stage: deploy_to_ECS
+  when: manual
+  
+  image: python:3.12-alpine
+  needs:
+    - job: Docker
+  only:
+    - main
+    - master
+  before_script:
+    - apk add --no-cache jq
+    - pip install awscli --quiet
+    - aws sts get-caller-identity
+  script:
+    - |
+      echo "Getting current ECS task definition..."
+
+      aws ecs describe-task-definition \
+        --task-definition "$ECS_TASK_DEFINITION" \
+        --region "$AWS_REGION" \
+        --query 'taskDefinition' \
+        --output json \
+      | jq 'del(
+          .taskDefinitionArn,
+          .revision,
+          .status,
+          .requiresAttributes,
+          .compatibilities,
+          .registeredAt,
+          .registeredBy
+        )' > task-def.json
+
+    - |
+      echo "Updating container image to: $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
+
+      jq \
+        --arg IMAGE "$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG" \
+        --arg NAME "$ECS_CONTAINER" \
+        '.containerDefinitions |= map(
+          if .name == $NAME
+          then .image = $IMAGE
+          else .
+          end
+        )' task-def.json > new-task-def.json
+
+    - |
+      echo "Registering new ECS task definition revision..."
+
+      NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+        --cli-input-json file://new-task-def.json \
+        --region "$AWS_REGION" \
+        --query 'taskDefinition.taskDefinitionArn' \
+        --output text)
+
+      echo "New task definition ARN: $NEW_TASK_DEF_ARN"
+
+    - |
+      echo "Updating ECS service..."
+
+      aws ecs update-service \
+        --cluster "$ECS_CLUSTER" \
+        --service "$ECS_SERVICE" \
+        --task-definition "$NEW_TASK_DEF_ARN" \
+        --force-new-deployment \
+        --region "$AWS_REGION"
+
+    - |
+      echo "Waiting for ECS service to stabilize..."
+
+      aws ecs wait services-stable \
+        --cluster "$ECS_CLUSTER" \
+        --services "$ECS_SERVICE" \
+        --region "$AWS_REGION"
+
+      echo "Deploy complete."
+      echo "Live image: $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
