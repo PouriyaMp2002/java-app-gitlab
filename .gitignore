@@ -1,0 +1,12 @@
+# Directories
+target/
+bin/
+
+# Keys
+*.pem
+*.key
+*.pub
+.env
+
+# Terraform
+terraform/.terraform/*
