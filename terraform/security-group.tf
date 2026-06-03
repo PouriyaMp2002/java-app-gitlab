@@ -81,11 +81,11 @@ resource "aws_vpc_security_group_ingress_rule" "sonar-port" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "sonar-from-runner" {
-  security_group_id = aws_security_group.sonarqube.id
+  security_group_id            = aws_security_group.sonarqube.id
   referenced_security_group_id = aws_security_group.runner.id
-  ip_protocol = "tcp"
-  from_port = 9000
-  to_port = 9000
+  ip_protocol                  = "tcp"
+  from_port                    = 9000
+  to_port                      = 9000
 }
 
 
